@@ -8,11 +8,14 @@ article:
   2. Splits the cleaned text into chunks and calls Gemini again to generate
      Q&A pairs in Mao's rhetorical style.
 
-Outputs training_data.jsonl with two record types:
+Outputs training_data.jsonl with two record types for use with Unsloth:
 
-  • Text-completion record  {"type":"text", "text":"...", "source_url":"...", "title":"..."}
-  • Instruction record      {"type":"qa",   "instruction":"...", "input":"",
-                             "output":"...", "source_url":"...", "title":"..."}
+  • CPT record   {"text": "…"}
+      Raw cleaned article text for continued pretraining.
+
+  • SFT record   {"messages": [{"role": "system", …}, {"role": "user", …},
+                               {"role": "assistant", …}]}
+      ChatML-format conversation for supervised instruction fine-tuning.
 
 Requires environment variable GEMINI_API_KEY.
 """
@@ -31,13 +34,21 @@ from google import genai
 RAW_DIR = "raw_articles"
 OUTPUT_FILE = "training_data.jsonl"
 
-GEMINI_MODEL = "gemini-3.1-flash-live-preview"
+GEMINI_MODEL = "gemini-2.0-flash"
 CHUNK_SIZE = 2500        # characters per text chunk sent to Gemini for cleaning
-QA_TEXT_LIMIT = 2000    # characters of cleaned text sent to Gemini for Q&A generation
+QA_TEXT_LIMIT = 2000     # characters of cleaned text sent to Gemini for Q&A generation
 QA_PAIRS_PER_CHUNK = 5   # number of Q&A pairs to request per chunk
 REQUEST_DELAY = 5        # seconds between Gemini calls (free-tier rate-limit)
 MAX_RETRIES = 4
 MIN_CONTENT_LEN = 150    # skip articles shorter than this
+
+SYSTEM_PROMPT = (
+    "You are Mao Zedong, Chairman of the Chinese Communist Party and founder "
+    "of the People's Republic of China. Speak in the first person with "
+    "authority, dialectical clarity, and revolutionary conviction. Ground your "
+    "answers in Marxist-Leninist theory and the concrete experience of the "
+    "Chinese revolution. Be direct and uncompromising."
+)
 
 CLEAN_PROMPT = """\
 You are processing a historical Chinese political text scraped from a webpage.
@@ -68,7 +79,7 @@ Guidelines:
 - Mix Chinese and English naturally if it fits the content.
 
 Return a JSON array and NOTHING else (no markdown fences, no prose).
-Each element must have exactly two keys: "instruction" and "output".
+Each element must have exactly two keys: "question" and "answer".
 
 EXCERPT:
 {text}
@@ -129,7 +140,6 @@ def chunk_text(text: str, size: int = CHUNK_SIZE) -> list[str]:
 
 def parse_qa_json(raw: str) -> list[dict]:
     """Extract a JSON array from *raw* (which may have markdown fences)."""
-    # Strip optional ```json … ``` fences
     raw = raw.strip()
     raw = re.sub(r"^```[a-zA-Z]*\n?", "", raw)
     raw = re.sub(r"\n?```$", "", raw)
@@ -142,7 +152,6 @@ def parse_qa_json(raw: str) -> list[dict]:
     except json.JSONDecodeError:
         pass
 
-    # Attempt to extract the first JSON array with a regex
     match = re.search(r"\[.*\]", raw, re.DOTALL)
     if match:
         try:
@@ -151,6 +160,17 @@ def parse_qa_json(raw: str) -> list[dict]:
             pass
 
     return []
+
+
+def make_sft_record(question: str, answer: str) -> dict:
+    """Wrap a Q&A pair into a ChatML-format SFT record for Unsloth."""
+    return {
+        "messages": [
+            {"role": "system",    "content": SYSTEM_PROMPT},
+            {"role": "user",      "content": question},
+            {"role": "assistant", "content": answer},
+        ]
+    }
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -173,7 +193,8 @@ def main() -> None:
 
     print(f"Processing {len(article_files)} articles with model {GEMINI_MODEL}…\n")
 
-    records: list[dict] = []
+    cpt_records: list[dict] = []
+    sft_records: list[dict] = []
 
     for idx, filepath in enumerate(article_files, 1):
         with open(filepath, "r", encoding="utf-8") as fh:
@@ -201,13 +222,8 @@ def main() -> None:
 
             cleaned = clean_resp.strip()
 
-            # Emit a text-completion record
-            records.append({
-                "type": "text",
-                "text": cleaned,
-                "source_url": url,
-                "title": title,
-            })
+            # Emit a CPT record (plain text, standard Unsloth format)
+            cpt_records.append({"text": cleaned})
 
             # ── Step 2: Generate Q&A pairs ────────────────────────────────
             qa_resp = call_gemini(
@@ -216,36 +232,27 @@ def main() -> None:
             )
             time.sleep(REQUEST_DELAY)
 
+            added = 0
             if qa_resp:
                 qa_pairs = parse_qa_json(qa_resp)
-                added = 0
                 for pair in qa_pairs:
-                    instruction = pair.get("instruction", "").strip()
-                    output = pair.get("output", "").strip()
-                    if instruction and output:
-                        records.append({
-                            "type": "qa",
-                            "instruction": instruction,
-                            "input": "",
-                            "output": output,
-                            "source_url": url,
-                            "title": title,
-                        })
+                    question = pair.get("question", "").strip()
+                    answer = pair.get("answer", "").strip()
+                    if question and answer:
+                        sft_records.append(make_sft_record(question, answer))
                         added += 1
-                print(f"  chunk {chunk_idx}/{len(chunks)}: +1 text, +{added} Q&A")
-            else:
-                print(f"  chunk {chunk_idx}/{len(chunks)}: +1 text, Q&A failed")
+
+            print(f"  chunk {chunk_idx}/{len(chunks)}: +1 CPT, +{added} SFT")
 
     # ── Write JSONL ────────────────────────────────────────────────────────────
+    all_records = cpt_records + sft_records
     with open(OUTPUT_FILE, "w", encoding="utf-8") as fh:
-        for record in records:
+        for record in all_records:
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-    text_count = sum(1 for r in records if r["type"] == "text")
-    qa_count = sum(1 for r in records if r["type"] == "qa")
     print(
-        f"\nWrote {len(records)} records to {OUTPUT_FILE} "
-        f"({text_count} text, {qa_count} Q&A)"
+        f"\nWrote {len(all_records)} records to {OUTPUT_FILE} "
+        f"({len(cpt_records)} CPT, {len(sft_records)} SFT)"
     )
 
 
