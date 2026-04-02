@@ -34,7 +34,7 @@ from google import genai
 RAW_DIR = "raw_articles"
 OUTPUT_FILE = "training_data.jsonl"
 
-GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_MODEL = "gemini-3.1-flash-lite-preview"
 CHUNK_SIZE = 2500        # characters per text chunk sent to Gemini for cleaning
 QA_TEXT_LIMIT = 2000     # characters of cleaned text sent to Gemini for Q&A generation
 QA_PAIRS_PER_CHUNK = 5   # number of Q&A pairs to request per chunk
