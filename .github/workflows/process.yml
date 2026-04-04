@@ -1,0 +1,44 @@
+name: Process Mao's Writings
+
+on:
+  workflow_dispatch:
+
+jobs:
+  process:
+    name: Process articles
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Process articles with Gemini
+        run: uv run python process_with_gemini.py
+
+      - name: Upload JSONL as artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: training-data
+          path: training_data.jsonl
+          retention-days: 30
+
+      - name: Create GitHub Release and upload JSONL
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "training-data-${{ github.run_number }}"
+          name: "Training Data – Run ${{ github.run_number }}"
+          body: |
+            ## QLoRA Training Data
+
+            Scraped from [marxists.org – Mao Zedong](https://www.marxists.org/chinese/maozedong/index.htm)
+            (public domain writings).
+          files: training_data.jsonl
+          token: ${{ secrets.GITHUB_TOKEN }}

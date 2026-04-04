@@ -25,7 +25,6 @@ import json
 import os
 import re
 import sys
-import time
 
 from google import genai
 
@@ -34,20 +33,18 @@ from google import genai
 RAW_DIR = "raw_articles"
 OUTPUT_FILE = "training_data.jsonl"
 
-GEMINI_MODEL = "gemini-3.1-flash-lite-preview"
-CHUNK_SIZE = 2500        # characters per text chunk sent to Gemini for cleaning
-QA_TEXT_LIMIT = 2000     # characters of cleaned text sent to Gemini for Q&A generation
+GEMINI_MODEL = "gemma-4-31b-it"
+FALLBACK_MODEL = "gemma-4-26b-it"   # TODO: update to a different backup model name
+CHUNK_SIZE = 25000        # characters per text chunk sent to Gemini for cleaning
+QA_TEXT_LIMIT = 20000     # characters of cleaned text sent to Gemini for Q&A generation
 QA_PAIRS_PER_CHUNK = 5   # number of Q&A pairs to request per chunk
-REQUEST_DELAY = 5        # seconds between Gemini calls (free-tier rate-limit)
-MAX_RETRIES = 4
+MAX_RETRIES = 10
 MIN_CONTENT_LEN = 150    # skip articles shorter than this
 
 SYSTEM_PROMPT = (
-    "You are Mao Zedong, Chairman of the Chinese Communist Party and founder "
-    "of the People's Republic of China. Speak in the first person with "
-    "authority, dialectical clarity, and revolutionary conviction. Ground your "
-    "answers in Marxist-Leninist theory and the concrete experience of the "
-    "Chinese revolution. Be direct and uncompromising."
+    "你是毛泽东，中国共产党主席，中华人民共和国的缔造者。"
+    "请用第一人称以中文回答，语气权威、辩证清晰、充满革命信念。"
+    "以马克思列宁主义理论和中国革命的具体实践为基础，直接而毫不妥协。"
 )
 
 CLEAN_PROMPT = """\
@@ -65,23 +62,19 @@ TEXT:
 """
 
 QA_PROMPT = """\
-You are building a dataset to fine-tune a language model in the style of
-Mao Zedong.  Based on the excerpt below, generate exactly {n} diverse
-question-and-answer pairs.
+你正在构建一个用于微调语言模型的数据集，使其模仿毛泽东的风格。
+请根据以下摘录，生成恰好 {n} 个多样化的问答对。
 
-Guidelines:
-- Questions should probe political theory, revolutionary strategy, historical
-  analysis, mass-line philosophy, or social criticism as found in the text.
-- Answers MUST be written in Mao Zedong's voice: direct, dialectical,
-  confident, rich with Marxist-Leninist terminology, and grounded in the
-  Chinese revolutionary experience.
-- Each answer should be 3–6 sentences minimum.
-- Mix Chinese and English naturally if it fits the content.
+要求：
+- 问题须以中文提出，涉及政治理论、革命战略、历史分析、群众路线哲学或社会批评等主题，内容须源自摘录。
+- 答案必须以毛泽东的口吻用中文作答：直接、辩证、自信，富含马克思列宁主义术语，根植于中国革命的具体经验。
+- 每个答案最少包含3至6句话。
+- 问题和答案均须使用中文。
 
-Return a JSON array and NOTHING else (no markdown fences, no prose).
-Each element must have exactly two keys: "question" and "answer".
+只返回一个 JSON 数组，不得包含 Markdown 代码块或任何说明文字。
+每个元素必须恰好包含两个键："question" 和 "answer"。
 
-EXCERPT:
+摘录：
 {text}
 """
 
@@ -92,21 +85,23 @@ def init_client(api_key: str) -> genai.Client:
 
 
 def call_gemini(prompt: str, client: genai.Client) -> str | None:
-    """Call Gemini with *prompt*, retrying on transient errors."""
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            response = client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=prompt,
-            )
-            return response.text
-        except Exception as exc:
-            print(
-                f"  [Gemini attempt {attempt}/{MAX_RETRIES}] Error: {exc}",
-                file=sys.stderr,
-            )
-            if attempt < MAX_RETRIES:
-                time.sleep(10 * attempt)
+    """Call Gemini with *prompt*, retrying on transient errors.
+    Falls back to FALLBACK_MODEL if all retries on GEMINI_MODEL fail."""
+    for model in dict.fromkeys([GEMINI_MODEL, FALLBACK_MODEL]):  # dedup while preserving order
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                response = client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                )
+                return response.text
+            except Exception as exc:
+                print(
+                    f"  [{model} attempt {attempt}/{MAX_RETRIES}] Error: {exc}",
+                    file=sys.stderr,
+                )
+        if model != FALLBACK_MODEL:
+            print(f"  Primary model {model} failed, trying fallback {FALLBACK_MODEL}…", file=sys.stderr)
     return None
 
 
@@ -193,66 +188,63 @@ def main() -> None:
 
     print(f"Processing {len(article_files)} articles with model {GEMINI_MODEL}…\n")
 
-    cpt_records: list[dict] = []
-    sft_records: list[dict] = []
+    total_cpt = 0
+    total_sft = 0
 
-    for idx, filepath in enumerate(article_files, 1):
-        with open(filepath, "r", encoding="utf-8") as fh:
-            article = json.load(fh)
+    with open(OUTPUT_FILE, "a", encoding="utf-8") as out:
+        for idx, filepath in enumerate(article_files, 1):
+            with open(filepath, "r", encoding="utf-8") as fh:
+                article = json.load(fh)
 
-        title = article.get("title", "")
-        url = article.get("url", "")
-        content = article.get("content", "")
+            title = article.get("title", "")
+            url = article.get("url", "")
+            content = article.get("content", "")
 
-        if not content or len(content) < MIN_CONTENT_LEN:
-            print(f"[{idx}/{len(article_files)}] SKIP (too short): {title or filepath}")
-            continue
-
-        print(f"[{idx}/{len(article_files)}] {title or url}")
-
-        chunks = chunk_text(content)
-        for chunk_idx, chunk in enumerate(chunks, 1):
-            # ── Step 1: Clean the chunk ───────────────────────────────────
-            clean_resp = call_gemini(CLEAN_PROMPT.format(text=chunk), client)
-            time.sleep(REQUEST_DELAY)
-
-            if not clean_resp or len(clean_resp.strip()) < 50:
-                print(f"  chunk {chunk_idx}: cleaning returned empty, skipping")
+            if not content or len(content) < MIN_CONTENT_LEN:
+                print(f"[{idx}/{len(article_files)}] SKIP (too short): {title or filepath}")
                 continue
 
-            cleaned = clean_resp.strip()
+            print(f"[{idx}/{len(article_files)}] {title or url}")
 
-            # Emit a CPT record (plain text, standard Unsloth format)
-            cpt_records.append({"text": cleaned})
+            chunks = chunk_text(content)
+            for chunk_idx, chunk in enumerate(chunks, 1):
+                # ── Step 1: Clean the chunk ───────────────────────────────────
+                clean_resp = call_gemini(CLEAN_PROMPT.format(text=chunk), client)
 
-            # ── Step 2: Generate Q&A pairs ────────────────────────────────
-            qa_resp = call_gemini(
-                QA_PROMPT.format(text=cleaned[:QA_TEXT_LIMIT], n=QA_PAIRS_PER_CHUNK),
-                client,
-            )
-            time.sleep(REQUEST_DELAY)
+                if not clean_resp or len(clean_resp.strip()) < 50:
+                    print(f"  chunk {chunk_idx}: cleaning returned empty, skipping")
+                    continue
 
-            added = 0
-            if qa_resp:
-                qa_pairs = parse_qa_json(qa_resp)
-                for pair in qa_pairs:
-                    question = pair.get("question", "").strip()
-                    answer = pair.get("answer", "").strip()
-                    if question and answer:
-                        sft_records.append(make_sft_record(question, answer))
-                        added += 1
+                cleaned = clean_resp.strip()
 
-            print(f"  chunk {chunk_idx}/{len(chunks)}: +1 CPT, +{added} SFT")
+                # Write CPT record immediately
+                out.write(json.dumps({"text": cleaned}, ensure_ascii=False) + "\n")
+                out.flush()
+                total_cpt += 1
 
-    # ── Write JSONL ────────────────────────────────────────────────────────────
-    all_records = cpt_records + sft_records
-    with open(OUTPUT_FILE, "w", encoding="utf-8") as fh:
-        for record in all_records:
-            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+                # ── Step 2: Generate Q&A pairs ────────────────────────────────
+                qa_resp = call_gemini(
+                    QA_PROMPT.format(text=cleaned[:QA_TEXT_LIMIT], n=QA_PAIRS_PER_CHUNK),
+                    client,
+                )
+
+                added = 0
+                if qa_resp:
+                    qa_pairs = parse_qa_json(qa_resp)
+                    for pair in qa_pairs:
+                        question = pair.get("question", "").strip()
+                        answer = pair.get("answer", "").strip()
+                        if question and answer:
+                            out.write(json.dumps(make_sft_record(question, answer), ensure_ascii=False) + "\n")
+                            out.flush()
+                            total_sft += 1
+                            added += 1
+
+                print(f"  chunk {chunk_idx}/{len(chunks)}: +1 CPT, +{added} SFT")
 
     print(
-        f"\nWrote {len(all_records)} records to {OUTPUT_FILE} "
-        f"({len(cpt_records)} CPT, {len(sft_records)} SFT)"
+        f"\nWrote {total_cpt + total_sft} records to {OUTPUT_FILE} "
+        f"({total_cpt} CPT, {total_sft} SFT)"
     )
 
 
