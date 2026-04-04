@@ -21,6 +21,8 @@ jobs:
         run: uv sync
 
       - name: Process articles with Gemini
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: uv run python process_with_gemini.py
 
       - name: Upload JSONL as artifact
