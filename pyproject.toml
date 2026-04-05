@@ -4,8 +4,8 @@ version = "0.1.0"
 description = "Scrape and process Mao Zedong's writings into QLoRA training data"
 requires-python = ">=3.12"
 dependencies = [
-    "requests>=2.32.3",
-    "beautifulsoup4>=4.12.3",
-    "lxml>=5.3.0",
-    "google-genai>=1.0.0",
+    "requests",
+    "beautifulsoup4",
+    "lxml",
+    "openai",
 ]

@@ -26,15 +26,15 @@ import os
 import re
 import sys
 
-from google import genai
+from openai import OpenAI
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 RAW_DIR = "raw_articles"
 OUTPUT_FILE = "training_data.jsonl"
 
-GEMINI_MODEL = "gemma-4-31b-it"
-FALLBACK_MODEL = "gemma-4-26b-it"   # TODO: update to a different backup model name
+GEMINI_MODEL = "deepseek-ai/deepseek-v3.2"
+FALLBACK_MODEL = "z-ai/glm4.7"
 CHUNK_SIZE = 25000        # characters per text chunk sent to Gemini for cleaning
 QA_TEXT_LIMIT = 20000     # characters of cleaned text sent to Gemini for Q&A generation
 QA_PAIRS_PER_CHUNK = 5   # number of Q&A pairs to request per chunk
@@ -80,21 +80,35 @@ QA_PROMPT = """\
 
 # ── Gemini helpers ─────────────────────────────────────────────────────────────
 
-def init_client(api_key: str) -> genai.Client:
-    return genai.Client(api_key=api_key)
+def init_client(api_key: str) -> OpenAI:
+    return OpenAI(
+        base_url="https://integrate.api.nvidia.com/v1",
+        api_key=api_key,
+    )
 
 
-def call_gemini(prompt: str, client: genai.Client) -> str | None:
-    """Call Gemini with *prompt*, retrying on transient errors.
+def call_gemini(prompt: str, client: OpenAI) -> str | None:
+    """Call the NVIDIA API with *prompt*, retrying on transient errors.
     Falls back to FALLBACK_MODEL if all retries on GEMINI_MODEL fail."""
     for model in dict.fromkeys([GEMINI_MODEL, FALLBACK_MODEL]):  # dedup while preserving order
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                response = client.models.generate_content(
+                completion = client.chat.completions.create(
                     model=model,
-                    contents=prompt,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=1,
+                    top_p=0.95,
+                    max_tokens=8192,
+                    extra_body={"chat_template_kwargs": {"thinking": True}},
+                    stream=True,
                 )
-                return response.text
+                parts: list[str] = []
+                for chunk in completion:
+                    if not getattr(chunk, "choices", None):
+                        continue
+                    if chunk.choices[0].delta.content is not None:
+                        parts.append(chunk.choices[0].delta.content)
+                return "".join(parts)
             except Exception as exc:
                 print(
                     f"  [{model} attempt {attempt}/{MAX_RETRIES}] Error: {exc}",
